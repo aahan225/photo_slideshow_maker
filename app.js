@@ -173,37 +173,64 @@ async function generateVideo() {
     // Frame size from the largest photo, capped by the chosen quality.
     const { W, H } = outputSize();
     $("resolutionLabel").textContent = `${W} × ${H}`;
-    // Two passes. Pass 1 normalises every photo once into the common frame; pass 2
-    // simply encodes those already-correct-size images. Scaling a large photo down
-    // on every one of the 30 frames per second was what made big exports crawl;
-    // doing it once per photo gives the same result several times faster.
-    const normFiles = [];
-    for (let i=0; i<photos.length; i++) {
-      setStatus(`Preparing photo ${i+1} of ${photos.length}…`, 2 + (i/photos.length)*16, `Photo ${i+1}/${photos.length}`);
-      const ext = (photos[i].file.name.split(".").pop() || "").toLowerCase();
-      const safeExt = ["jpg","jpeg","png","webp","bmp"].includes(ext) ? ext : "png";
-      const srcName = `src_${String(i).padStart(4,"0")}.${safeExt}`;
-      // Keep the in-memory frame compact: PNG for normal sizes, JPEG for huge ones.
-      const asJpeg = W * H > 2500000;
-      const normName = `norm_${String(i).padStart(4,"0")}.${asJpeg ? "jpg" : "png"}`;
-      await enc.writeFile(srcName, new Uint8Array(await photos[i].file.arrayBuffer()));
-      const fit = `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
-      await enc.exec(asJpeg
-        ? ["-y","-i",srcName,"-vf",fit,"-frames:v","1","-q:v","2",normName]
-        : ["-y","-i",srcName,"-vf",fit,"-frames:v","1",normName]);
-      await enc.deleteFile(srcName);
-      normFiles.push({filename: normName, duration: photos[i].duration || seconds()});
+    // Work in chunks. ffmpeg.wasm does not release the memory used by repeated
+    // exec() calls, so on a long album the wasm heap fills up part-way through and
+    // throws "memory access out of bounds". Each chunk is normalised, encoded to
+    // its own part file, and then the whole encoder is torn down and rebuilt, which
+    // hands the memory back. The parts are joined at the end with a stream copy, so
+    // nothing is re-encoded. The chunk shrinks for large source photos, because a
+    // big image decode is what consumes the memory.
+    const asJpeg = W * H > 2500000;
+    const fit = `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
+    const srcPixels = photos.reduce((m, p) => Math.max(m, p.width * p.height), 0);
+    const CHUNK = Math.max(1, Math.min(12, Math.floor((600 * 1024 * 1024) / Math.max(1, srcPixels * 4))));
+    const total = photos.length;
+    const parts = [];
+    for (let start = 0; start < total; start += CHUNK) {
+      const slice = photos.slice(start, start + CHUNK);
+      const enc = await loadEncoder();
+      const norm = [];
+      for (let j = 0; j < slice.length; j++) {
+        const i = start + j, p = slice[j];
+        setStatus(`Preparing photo ${i+1} of ${total}…`, 2 + (i / total) * 18, `Photo ${i+1}/${total}`);
+        const ext = (p.file.name.split(".").pop() || "").toLowerCase();
+        const safeExt = ["jpg","jpeg","png","webp","bmp"].includes(ext) ? ext : "png";
+        const srcName = `src_${String(i).padStart(4,"0")}.${safeExt}`;
+        const normName = `norm_${String(i).padStart(4,"0")}.${asJpeg ? "jpg" : "png"}`;
+        await enc.writeFile(srcName, new Uint8Array(await p.file.arrayBuffer()));
+        await enc.exec(asJpeg
+          ? ["-y","-i",srcName,"-vf",fit,"-frames:v","1","-q:v","2",normName]
+          : ["-y","-i",srcName,"-vf",fit,"-frames:v","1",normName]);
+        await enc.deleteFile(srcName);
+        norm.push({ filename: normName, duration: p.duration || seconds() });
+      }
+      setStatus("Encoding MP4…", 20 + ((start + slice.length) / total) * 72, `Encoding part ${parts.length + 1}`);
+      let concat = "";
+      for (const item of norm) concat += `file '${item.filename}'\nduration ${item.duration}\n`;
+      concat += `file '${norm[norm.length-1].filename}'\n`;
+      await enc.writeFile("photos.txt", new TextEncoder().encode(concat));
+      const partDuration = norm.reduce((sum, item) => sum + item.duration, 0);
+      const partName = `part_${parts.length}.mp4`;
+      await enc.exec(["-y","-f","concat","-safe","0","-i","photos.txt","-vf",`fps=${frameRate()},format=yuv420p`,"-vsync","vfr","-c:v","libx264","-preset","ultrafast","-crf","18","-movflags","+faststart","-t",String(partDuration),partName]);
+      // Copy the bytes out before the encoder goes away: the read view points into
+      // wasm memory that is released by terminate().
+      parts.push(new Uint8Array(await enc.readFile(partName)));
+      try { ffmpeg.terminate(); } catch {}
+      ffmpeg = null;
     }
-    setStatus("Encoding MP4…",20,"Encoding video");
-    // Every normalised image is now exactly W×H, so the concat demuxer can join them.
-    let concat = "";
-    for (const item of normFiles) concat += `file '${item.filename}'\nduration ${item.duration}\n`;
-    concat += `file '${normFiles[normFiles.length-1].filename}'\n`;
-    await enc.writeFile("photos.txt", new TextEncoder().encode(concat));
-    const totalDuration = normFiles.reduce((sum,item) => sum + item.duration, 0);
-    await enc.exec(["-y","-f","concat","-safe","0","-i","photos.txt","-vf",`fps=${frameRate()},format=yuv420p`,"-vsync","vfr","-c:v","libx264","-preset","ultrafast","-crf","18","-movflags","+faststart","-t",String(totalDuration),"output.mp4"]);
-    setStatus("Preparing your download…",97,"Finalising MP4");
-    const data = await enc.readFile("output.mp4");
+    setStatus("Preparing your download…",94,"Joining video");
+    let data;
+    if (parts.length === 1) {
+      data = parts[0];
+    } else {
+      const enc = await loadEncoder();
+      for (let i = 0; i < parts.length; i++) await enc.writeFile(`part_${i}.mp4`, parts[i]);
+      let list = "";
+      for (let i = 0; i < parts.length; i++) list += `file 'part_${i}.mp4'\n`;
+      await enc.writeFile("parts.txt", new TextEncoder().encode(list));
+      await enc.exec(["-y","-f","concat","-safe","0","-i","parts.txt","-c","copy","-movflags","+faststart","output.mp4"]);
+      data = new Uint8Array(await enc.readFile("output.mp4"));
+    }
     const blob = new Blob([data.buffer], {type:"video/mp4"});
     if (outputUrl) URL.revokeObjectURL(outputUrl);
     outputUrl = URL.createObjectURL(blob);
@@ -213,7 +240,8 @@ async function generateVideo() {
     setStatus("Your slideshow is ready. Click Download MP4 to save it.",100,`${(blob.size/1024/1024).toFixed(1)} MB`);
   } catch (err) {
     console.error(err);
-    setStatus(`Export failed: ${err?.message || err}. Try fewer photos or a lower-resolution set, and check your internet connection.`,0,"Export error");
+    try { if (ffmpeg) { ffmpeg.terminate(); ffmpeg = null; } } catch {}
+    setStatus(`Export failed: ${err?.message || err}. Try again, or lower the Quality or Frame rate setting.`,0,"Export error");
   } finally {
     exporting = false; $("generateBtn").disabled = !photos.length; $("generateBtn").textContent = "⚙ Generate MP4";
     $("clearBtn").disabled = !photos.length; renderList();
