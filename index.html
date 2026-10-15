@@ -52,9 +52,23 @@
 
   <aside class="panel export-panel">
     <div class="section-heading"><span class="step">4</span><div><h2>Export video</h2><p>Save your slideshow as an MP4 file.</p></div></div>
-    <div class="setting-row"><span>Output size</span><strong id="resolutionLabel">Based on largest photo</strong></div>
+    <div class="setting-row"><span>Quality</span>
+      <select id="quality" style="background:#0b1626;color:#e8f0fb;border:1px solid #24354d;border-radius:8px;padding:6px 8px;font:inherit;max-width:60%">
+        <option value="1920" selected>1080p — recommended</option>
+        <option value="1280">720p — fastest</option>
+        <option value="0">Original size — slowest</option>
+      </select>
+    </div>
+    <div class="setting-row"><span>Frame size</span><strong id="resolutionLabel">Based on largest photo</strong></div>
     <div class="setting-row"><span>Format</span><strong>MP4 · H.264</strong></div>
-    <div class="setting-row"><span>Frame rate</span><strong>30 FPS</strong></div>
+    <div class="setting-row"><span>Frame rate</span>
+      <select id="fps" style="background:#0b1626;color:#e8f0fb;border:1px solid #24354d;border-radius:8px;padding:6px 8px;font:inherit;max-width:60%">
+        <option value="30" selected>30 fps</option>
+        <option value="24">24 fps</option>
+        <option value="15">15 fps — faster</option>
+        <option value="10">10 fps — fastest</option>
+      </select>
+    </div>
     <div class="setting-row"><span>Total duration</span><strong id="totalDuration">0 seconds</strong></div>
     <button id="generateBtn" class="primary" disabled>⚙ Generate MP4</button>
     <div id="statusBox" class="status-box">
