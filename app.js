@@ -10,6 +10,7 @@ const workerUrl = new URL("ffmpeg-worker.js", location.href).href;
 
 const $ = (id) => document.getElementById(id);
 const input = $("photoInput"), list = $("photoList"), durationInput = $("duration");
+const qualitySelect = $("quality"), fpsSelect = $("fps");
 const preview = $("preview"), ctx = preview.getContext("2d");
 let photos = [], selectedIndex = -1, dragIndex = null, ffmpeg = null, outputUrl = null, exporting = false;
 
@@ -20,6 +21,27 @@ function seconds() {
 function fmtTime(s) {
   const whole = Math.round(s);
   return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, "0")}`;
+}
+function frameRate() {
+  // Stills have no motion, so a lower rate looks identical but encodes far fewer
+  // frames; this is the single biggest lever on export time for a slideshow.
+  const n = Number(fpsSelect.value);
+  return Number.isFinite(n) && n >= 1 && n <= 60 ? n : 30;
+}
+function outputSize() {
+  // Frame size comes from the largest photo by pixel area, then is capped by the
+  // chosen quality. The encoder runs single-threaded in WebAssembly, so its speed
+  // depends on frame pixels: 1080p renders many times faster than a 12-48 MP frame
+  // while looking the same on any screen. 0 means keep the original size.
+  const cap = Number(qualitySelect.value) || 0;
+  const biggest = photos.reduce((a,b) => (a.width*a.height >= b.width*b.height ? a : b));
+  let w = biggest.width, h = biggest.height;
+  if (cap > 0) {
+    const scale = Math.min(1, cap / Math.max(w, h));
+    w = Math.max(2, Math.round(w * scale));
+    h = Math.max(2, Math.round(h * scale));
+  }
+  return { W: w + (w % 2), H: h + (h % 2) };
 }
 function updateSummary() {
   const total = photos.reduce((sum, p) => sum + (p.duration || seconds()), 0);
@@ -32,8 +54,8 @@ function updateSummary() {
   $("nextBtn").disabled = photos.length < 2 || selectedIndex >= photos.length - 1;
   $("previewIndex").textContent = photos.length ? `${selectedIndex + 1} / ${photos.length}` : "0 / 0";
   if (photos.length) {
-    const biggest = photos.reduce((a,b) => (a.width*a.height >= b.width*b.height ? a : b));
-    $("resolutionLabel").textContent = `${biggest.width} × ${biggest.height}`;
+    const { W, H } = outputSize();
+    $("resolutionLabel").textContent = `${W} × ${H}`;
   } else $("resolutionLabel").textContent = "Based on largest photo";
 }
 function drawPreview() {
@@ -148,35 +170,38 @@ async function generateVideo() {
   $("generateBtn").textContent = "Rendering…"; $("clearBtn").disabled = true;
   try {
     const enc = await loadEncoder();
-    // Choose the dimensions of the largest photo by pixel area; round up to even dimensions for H.264.
-    const biggest = photos.reduce((a,b) => (a.width*a.height >= b.width*b.height ? a : b));
-    const W = biggest.width + (biggest.width % 2), H = biggest.height + (biggest.height % 2);
+    // Frame size from the largest photo, capped by the chosen quality.
+    const { W, H } = outputSize();
     $("resolutionLabel").textContent = `${W} × ${H}`;
-    const fileList = [];
+    // Two passes. Pass 1 normalises every photo once into the common frame; pass 2
+    // simply encodes those already-correct-size images. Scaling a large photo down
+    // on every one of the 30 frames per second was what made big exports crawl;
+    // doing it once per photo gives the same result several times faster.
+    const normFiles = [];
     for (let i=0; i<photos.length; i++) {
-      setStatus(`Preparing photo ${i+1} of ${photos.length}…`, 5 + (i/photos.length)*18, `Photo ${i+1}/${photos.length}`);
+      setStatus(`Preparing photo ${i+1} of ${photos.length}…`, 2 + (i/photos.length)*16, `Photo ${i+1}/${photos.length}`);
       const ext = (photos[i].file.name.split(".").pop() || "").toLowerCase();
       const safeExt = ["jpg","jpeg","png","webp","bmp"].includes(ext) ? ext : "png";
-      const filename = `photo_${String(i).padStart(4,"0")}.${safeExt}`;
-      await enc.writeFile(filename, new Uint8Array(await photos[i].file.arrayBuffer()));
-      fileList.push({filename, duration: photos[i].duration || seconds()});
+      const srcName = `src_${String(i).padStart(4,"0")}.${safeExt}`;
+      // Keep the in-memory frame compact: PNG for normal sizes, JPEG for huge ones.
+      const asJpeg = W * H > 2500000;
+      const normName = `norm_${String(i).padStart(4,"0")}.${asJpeg ? "jpg" : "png"}`;
+      await enc.writeFile(srcName, new Uint8Array(await photos[i].file.arrayBuffer()));
+      const fit = `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
+      await enc.exec(asJpeg
+        ? ["-y","-i",srcName,"-vf",fit,"-frames:v","1","-q:v","2",normName]
+        : ["-y","-i",srcName,"-vf",fit,"-frames:v","1",normName]);
+      await enc.deleteFile(srcName);
+      normFiles.push({filename: normName, duration: photos[i].duration || seconds()});
     }
-    // Build the export. Each photo becomes its own looped input held on screen for
-    // its own duration, and every input is scaled and padded to the common frame
-    // BEFORE the streams are joined. The concat demuxer used previously could not
-    // join images of different sizes or aspect ratios: it silently dropped all but
-    // one photo, so a mixed album produced a movie with a single picture in it.
-    setStatus("Encoding MP4…",25,"Encoding video");
-    const args = ["-y"];
-    for (const item of fileList) {
-      args.push("-loop","1","-t",String(item.duration),"-i",item.filename);
-    }
-    const chains = fileList.map((_, i) =>
-      `[${i}:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p[v${i}]`
-    );
-    const joined = fileList.map((_, i) => `[v${i}]`).join("");
-    const filterComplex = `${chains.join(";")};${joined}concat=n=${fileList.length}:v=1:a=0[outv]`;
-    await enc.exec([...args,"-filter_complex",filterComplex,"-map","[outv]","-c:v","libx264","-preset","ultrafast","-crf","18","-movflags","+faststart","output.mp4"]);
+    setStatus("Encoding MP4…",20,"Encoding video");
+    // Every normalised image is now exactly W×H, so the concat demuxer can join them.
+    let concat = "";
+    for (const item of normFiles) concat += `file '${item.filename}'\nduration ${item.duration}\n`;
+    concat += `file '${normFiles[normFiles.length-1].filename}'\n`;
+    await enc.writeFile("photos.txt", new TextEncoder().encode(concat));
+    const totalDuration = normFiles.reduce((sum,item) => sum + item.duration, 0);
+    await enc.exec(["-y","-f","concat","-safe","0","-i","photos.txt","-vf",`fps=${frameRate()},format=yuv420p`,"-vsync","vfr","-c:v","libx264","-preset","ultrafast","-crf","18","-movflags","+faststart","-t",String(totalDuration),"output.mp4"]);
     setStatus("Preparing your download…",97,"Finalising MP4");
     const data = await enc.readFile("output.mp4");
     const blob = new Blob([data.buffer], {type:"video/mp4"});
@@ -196,6 +221,7 @@ async function generateVideo() {
 }
 input.addEventListener("change", e => { addFiles(e.target.files); input.value = ""; });
 durationInput.addEventListener("input", () => { if (Number(durationInput.value) > 0) updateSummary(); });
+qualitySelect.addEventListener("change", () => { if (photos.length) updateSummary(); });
 $("applyDurationBtn").addEventListener("click", () => {
   const value = Number(durationInput.value);
   if (!Number.isFinite(value) || value < 1 || value > 120) { setStatus("Duration must be between 1 and 120 seconds.",0,"Invalid duration"); return; }
