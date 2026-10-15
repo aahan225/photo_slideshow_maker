@@ -13,6 +13,7 @@ const input = $("photoInput"), list = $("photoList"), durationInput = $("duratio
 const qualitySelect = $("quality"), fpsSelect = $("fps");
 const preview = $("preview"), ctx = preview.getContext("2d");
 let photos = [], selectedIndex = -1, dragIndex = null, ffmpeg = null, outputUrl = null, exporting = false;
+let previewImage = null, previewImageIndex = -1;
 
 function seconds() {
   const n = Number(durationInput.value);
@@ -58,15 +59,35 @@ function updateSummary() {
     $("resolutionLabel").textContent = `${W} × ${H}`;
   } else $("resolutionLabel").textContent = "Based on largest photo";
 }
+function paintPreview(p, source, sw, sh) {
+  const scale = Math.min(preview.width/p.width, preview.height/p.height);
+  const w = p.width*scale, h = p.height*scale;
+  ctx.drawImage(source, 0, 0, sw, sh, (preview.width-w)/2, (preview.height-h)/2, w, h);
+}
 function drawPreview() {
   ctx.fillStyle = "#03070d"; ctx.fillRect(0,0,preview.width,preview.height);
   if (selectedIndex < 0 || !photos[selectedIndex]) {
     ctx.fillStyle = "#a8bad0"; ctx.font = "18px sans-serif"; ctx.textAlign = "center";
     ctx.fillText("Add photos to preview your slideshow", preview.width/2, preview.height/2); return;
   }
-  const p = photos[selectedIndex], scale = Math.min(preview.width/p.width, preview.height/p.height);
-  const w = p.width*scale, h = p.height*scale;
-  ctx.drawImage(p.image, (preview.width-w)/2, (preview.height-h)/2, w, h);
+  const p = photos[selectedIndex];
+  if (previewImageIndex === selectedIndex && previewImage) {
+    paintPreview(p, previewImage, previewImage.width, previewImage.height);
+    return;
+  }
+  // Decode just the selected photo, at roughly preview size, and keep only that one.
+  const index = selectedIndex;
+  const img = new Image();
+  previewImage = img;
+  previewImageIndex = index;
+  // Paint only if this is still the image we are waiting for, so a slow decode
+  // cannot overwrite a newer selection.
+  img.onload = () => {
+    if (previewImage === img && previewImageIndex === index) {
+      paintPreview(p, img, img.naturalWidth, img.naturalHeight);
+    }
+  };
+  img.src = p.url;
 }
 function renderList() {
   list.replaceChildren();
@@ -76,7 +97,7 @@ function renderList() {
   } else photos.forEach((p, i) => {
     const card = document.createElement("div"); card.className = "photo-card" + (i === selectedIndex ? " selected" : "");
     card.draggable = !exporting; card.dataset.index = i;
-    const img = document.createElement("img"); img.src = p.url; img.alt = p.name;
+    const img = document.createElement("img"); img.src = p.thumbUrl; img.alt = p.name;
     const num = document.createElement("span"); num.className = "photo-number"; num.textContent = i + 1;
     const remove = document.createElement("button"); remove.className = "remove-photo"; remove.type = "button"; remove.textContent = "×"; remove.title = "Remove photo";
     remove.addEventListener("click", e => { e.stopPropagation(); removePhoto(i); });
@@ -110,6 +131,17 @@ function renderList() {
   });
   updateSummary();
 }
+function makeThumbnail(image) {
+  // A small copy for the list, so a big album does not keep every full-size photo
+  // decoded in memory (which is what starves the encoder of memory).
+  const max = 240;
+  const scale = Math.min(1, max / Math.max(image.naturalWidth, image.naturalHeight));
+  const w = Math.max(1, Math.round(image.naturalWidth * scale));
+  const h = Math.max(1, Math.round(image.naturalHeight * scale));
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  c.getContext("2d").drawImage(image, 0, 0, w, h);
+  return c.toDataURL("image/jpeg", 0.7);
+}
 function addFiles(files) {
   const candidates = [...files].filter(f => f.type.startsWith("image/"));
   if (!candidates.length) return setStatus("No supported images found. Choose JPG, PNG, WebP, or another browser-readable image.",0,"Waiting for photos");
@@ -117,7 +149,11 @@ function addFiles(files) {
   for (const file of candidates) {
     const url = URL.createObjectURL(file), image = new Image();
     image.onload = () => {
-      photos.push({file,url,image,name:file.name,width:image.naturalWidth,height:image.naturalHeight,duration:seconds()});
+      image.onload = image.onerror = null;   // detach first: clearing src re-fires error
+      const thumbUrl = makeThumbnail(image);
+      const width = image.naturalWidth, height = image.naturalHeight;
+      image.src = "";   // release the full-size decode straight away
+      photos.push({file,url,thumbUrl,name:file.name,width,height,duration:seconds()});
       pending--;
       if (selectedIndex < 0) selectedIndex = 0;
       if (pending === 0) { renderList(); drawPreview(); setStatus(`${photos.length} photo(s) ready to export.`,0,"Ready"); }
@@ -129,6 +165,7 @@ function addFiles(files) {
 function removePhoto(i) {
   if (exporting) return;
   URL.revokeObjectURL(photos[i].url); photos.splice(i,1);
+  previewImage = null; previewImageIndex = -1;
   if (!photos.length) selectedIndex = -1;
   else if (selectedIndex >= photos.length) selectedIndex = photos.length-1;
   else if (i < selectedIndex) selectedIndex--;
@@ -164,6 +201,32 @@ async function loadEncoder() {
   ffmpeg = instance;
   return ffmpeg;
 }
+async function renderFrame(photo, W, H) {
+  // Scale and letterbox the photo here, in the browser, and hand ffmpeg only the
+  // finished frame. ffmpeg.wasm decoding the full-size originals inside its own
+  // heap is what caused "memory access out of bounds".
+  const scale = Math.min(W / photo.width, H / photo.height);
+  const dw = Math.max(1, Math.round(photo.width * scale));
+  const dh = Math.max(1, Math.round(photo.height * scale));
+  let bmp;
+  try {
+    // Decode at (at most) the frame size so a huge photo is never fully expanded.
+    bmp = await createImageBitmap(photo.file, { resizeWidth: dw, resizeHeight: dh, resizeQuality: "high" });
+  } catch {
+    bmp = await createImageBitmap(photo.file);
+  }
+  try {
+    const c = document.createElement("canvas");
+    c.width = W; c.height = H;
+    const g = c.getContext("2d");
+    g.fillStyle = "#000"; g.fillRect(0, 0, W, H);
+    g.drawImage(bmp, Math.round((W - dw) / 2), Math.round((H - dh) / 2), dw, dh);
+    const blob = await new Promise((resolve) => c.toBlob(resolve, "image/jpeg", 0.92));
+    return new Uint8Array(await blob.arrayBuffer());
+  } finally {
+    if (bmp && bmp.close) bmp.close();
+  }
+}
 async function generateVideo() {
   if (!photos.length || exporting) return;
   exporting = true; $("downloadLink").hidden = true; $("generateBtn").disabled = true;
@@ -173,18 +236,12 @@ async function generateVideo() {
     // Frame size from the largest photo, capped by the chosen quality.
     const { W, H } = outputSize();
     $("resolutionLabel").textContent = `${W} × ${H}`;
-    // Work in chunks. ffmpeg.wasm does not release the memory used by repeated
-    // exec() calls, so on a long album the wasm heap fills up part-way through and
-    // throws "memory access out of bounds". Each chunk is normalised, encoded to
-    // its own part file, and then the whole encoder is torn down and rebuilt, which
-    // hands the memory back. The parts are joined at the end with a stream copy, so
-    // nothing is re-encoded. The chunk shrinks for large source photos, because a
-    // big image decode is what consumes the memory.
-    const asJpeg = W * H > 2500000;
-    const fit = `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
-    const srcPixels = photos.reduce((m, p) => Math.max(m, p.width * p.height), 0);
-    const CHUNK = Math.max(1, Math.min(12, Math.floor((600 * 1024 * 1024) / Math.max(1, srcPixels * 4))));
+    // Every photo is scaled and letterboxed in the browser first, so ffmpeg only
+    // ever sees small, already-correct-size images. Encoding still runs in batches
+    // with the encoder rebuilt between them, which keeps its memory flat no matter
+    // how large the album is.
     const total = photos.length;
+    const CHUNK = 12;
     const parts = [];
     for (let start = 0; start < total; start += CHUNK) {
       const slice = photos.slice(start, start + CHUNK);
@@ -193,16 +250,9 @@ async function generateVideo() {
       for (let j = 0; j < slice.length; j++) {
         const i = start + j, p = slice[j];
         setStatus(`Preparing photo ${i+1} of ${total}…`, 2 + (i / total) * 18, `Photo ${i+1}/${total}`);
-        const ext = (p.file.name.split(".").pop() || "").toLowerCase();
-        const safeExt = ["jpg","jpeg","png","webp","bmp"].includes(ext) ? ext : "png";
-        const srcName = `src_${String(i).padStart(4,"0")}.${safeExt}`;
-        const normName = `norm_${String(i).padStart(4,"0")}.${asJpeg ? "jpg" : "png"}`;
-        await enc.writeFile(srcName, new Uint8Array(await p.file.arrayBuffer()));
-        await enc.exec(asJpeg
-          ? ["-y","-i",srcName,"-vf",fit,"-frames:v","1","-q:v","2",normName]
-          : ["-y","-i",srcName,"-vf",fit,"-frames:v","1",normName]);
-        await enc.deleteFile(srcName);
-        norm.push({ filename: normName, duration: p.duration || seconds() });
+        const name = `norm_${String(i).padStart(4,"0")}.jpg`;
+        await enc.writeFile(name, await renderFrame(p, W, H));
+        norm.push({ filename: name, duration: p.duration || seconds() });
       }
       setStatus("Encoding MP4…", 20 + ((start + slice.length) / total) * 72, `Encoding part ${parts.length + 1}`);
       let concat = "";
@@ -212,8 +262,6 @@ async function generateVideo() {
       const partDuration = norm.reduce((sum, item) => sum + item.duration, 0);
       const partName = `part_${parts.length}.mp4`;
       await enc.exec(["-y","-f","concat","-safe","0","-i","photos.txt","-vf",`fps=${frameRate()},format=yuv420p`,"-vsync","vfr","-c:v","libx264","-preset","ultrafast","-crf","18","-movflags","+faststart","-t",String(partDuration),partName]);
-      // Copy the bytes out before the encoder goes away: the read view points into
-      // wasm memory that is released by terminate().
       parts.push(new Uint8Array(await enc.readFile(partName)));
       try { ffmpeg.terminate(); } catch {}
       ffmpeg = null;
@@ -258,7 +306,7 @@ $("applyDurationBtn").addEventListener("click", () => {
 });
 $("prevBtn").addEventListener("click", () => { if (selectedIndex>0) {selectedIndex--;renderList();drawPreview();} });
 $("nextBtn").addEventListener("click", () => { if (selectedIndex<photos.length-1) {selectedIndex++;renderList();drawPreview();} });
-$("clearBtn").addEventListener("click", () => { if (exporting) return; photos.forEach(p=>URL.revokeObjectURL(p.url));photos=[];selectedIndex=-1;renderList();drawPreview();setStatus("Add photos to begin.",0,"No export started");$("downloadLink").hidden=true; });
+$("clearBtn").addEventListener("click", () => { if (exporting) return; photos.forEach(p=>URL.revokeObjectURL(p.url));photos=[];selectedIndex=-1;previewImage=null;previewImageIndex=-1;renderList();drawPreview();setStatus("Add photos to begin.",0,"No export started");$("downloadLink").hidden=true; });
 $("generateBtn").addEventListener("click", generateVideo);
 const dz = $("dropzone");
 dz.addEventListener("dragover", e=>{e.preventDefault();dz.classList.add("dragover");});
