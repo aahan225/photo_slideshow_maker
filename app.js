@@ -161,14 +161,22 @@ async function generateVideo() {
       await enc.writeFile(filename, new Uint8Array(await photos[i].file.arrayBuffer()));
       fileList.push({filename, duration: photos[i].duration || seconds()});
     }
-    // FFmpeg concat demuxer honours each image duration; repeat the last image so its duration is retained.
-    let concat = "";
-    for (const item of fileList) concat += `file '${item.filename}'\nduration ${item.duration}\n`;
-    concat += `file '${fileList[fileList.length-1].filename}'\n`;
-    await enc.writeFile("photos.txt", new TextEncoder().encode(concat));
+    // Build the export. Each photo becomes its own looped input held on screen for
+    // its own duration, and every input is scaled and padded to the common frame
+    // BEFORE the streams are joined. The concat demuxer used previously could not
+    // join images of different sizes or aspect ratios: it silently dropped all but
+    // one photo, so a mixed album produced a movie with a single picture in it.
     setStatus("Encoding MP4…",25,"Encoding video");
-    const filter = `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p`;
-    await enc.exec(["-f","concat","-safe","0","-i","photos.txt","-vf",filter,"-vsync","vfr","-c:v","libx264","-preset","ultrafast","-crf","18","-movflags","+faststart","-t",String(fileList.reduce((sum,item)=>sum+item.duration,0)),"output.mp4"]);
+    const args = ["-y"];
+    for (const item of fileList) {
+      args.push("-loop","1","-t",String(item.duration),"-i",item.filename);
+    }
+    const chains = fileList.map((_, i) =>
+      `[${i}:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p[v${i}]`
+    );
+    const joined = fileList.map((_, i) => `[v${i}]`).join("");
+    const filterComplex = `${chains.join(";")};${joined}concat=n=${fileList.length}:v=1:a=0[outv]`;
+    await enc.exec([...args,"-filter_complex",filterComplex,"-map","[outv]","-c:v","libx264","-preset","ultrafast","-crf","18","-movflags","+faststart","output.mp4"]);
     setStatus("Preparing your download…",97,"Finalising MP4");
     const data = await enc.readFile("output.mp4");
     const blob = new Blob([data.buffer], {type:"video/mp4"});
